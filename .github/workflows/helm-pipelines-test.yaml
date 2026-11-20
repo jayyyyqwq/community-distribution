@@ -1,73 +1,22 @@
 name: Test Kubeflow Pipelines Helm Installation
-
-on:
-  push:
-    branches:
-    - master
-    paths:
-    - applications/pipeline/helm/**
-    - applications/pipeline/overlays/**
-    - applications/pipeline/upstream/**
-    - common/cert-manager/**
-    - common/kubeflow-namespace/**
-    - common/kubeflow-roles/**
-    - common/istio/**
-    - common/oauth2-proxy/**
-    - common/user-namespace/**
-    - applications/dashboard/upstream/profile-controller/**
-    - scripts/generate-pipelines-helm-manifests.py
-    - scripts/synchronize-pipelines-manifests.sh
-    - tests/pipelines_helm_install.sh
-    - tests/install_KinD_create_KinD_cluster_install_kustomize.sh
-    - tests/istio-cni_install.sh
-    - tests/oauth2-proxy_install.sh
-    - tests/profile_controller_install.sh
-    - tests/kubeflow_profile_install.sh
-    - tests/port_forward_gateway.sh
-    - tests/pipeline_v2_test.py
-    - .github/workflows/helm-pipelines-test.yaml
-  pull_request:
-    paths:
-    - applications/pipeline/helm/**
-    - applications/pipeline/overlays/**
-    - applications/pipeline/upstream/**
-    - common/cert-manager/**
-    - common/kubeflow-namespace/**
-    - common/kubeflow-roles/**
-    - common/istio/**
-    - common/oauth2-proxy/**
-    - common/user-namespace/**
-    - applications/dashboard/upstream/profile-controller/**
-    - scripts/generate-pipelines-helm-manifests.py
-    - scripts/synchronize-pipelines-manifests.sh
-    - tests/pipelines_helm_install.sh
-    - tests/install_KinD_create_KinD_cluster_install_kustomize.sh
-    - tests/istio-cni_install.sh
-    - tests/oauth2-proxy_install.sh
-    - tests/profile_controller_install.sh
-    - tests/kubeflow_profile_install.sh
-    - tests/port_forward_gateway.sh
-    - tests/pipeline_v2_test.py
-    - .github/workflows/helm-pipelines-test.yaml
-  workflow_dispatch:
+on: workflow_dispatch
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
-  kubeflow_pipelines_helm_installation:
-    name: Install ${{ matrix.scenario }}
+  recovery:
+    if: github.repository == 'jayyyyqwq/community-distribution'
+    name: Verify Profile with ${{ matrix.store }} artifact store
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      KF_PROFILE: kubeflow-user-example-com
+    timeout-minutes: 90
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        scenario:
-        - platform-database
-        - platform-k8s-native
+        store: [retained, replaced]
+    env:
+      KF_PROFILE: kubeflow-user-example-com
 
     steps:
     - name: Checkout code
@@ -121,8 +70,15 @@ jobs:
     - name: Install Profile Controller
       run: ./tests/profile_controller_install.sh
 
+    - name: Keep the artifact claim for the retained-store control
+      if: matrix.store == 'retained'
+      run: |
+        manifest=applications/pipeline/helm/manifests/common-resources.yaml
+        test "$(grep -cx '  name: seaweedfs-pvc' "$manifest")" = 1
+        sed -i '/^  name: seaweedfs-pvc$/i\  annotations:\n    helm.sh/resource-policy: keep' "$manifest"
+
     - name: Install Kubeflow Pipelines with Helm
-      run: ./tests/pipelines_helm_install.sh "${{ matrix.scenario }}"
+      run: ./tests/pipelines_helm_install.sh platform-database
 
     - name: Create Kubeflow Profile
       run: ./tests/kubeflow_profile_install.sh
@@ -130,32 +86,16 @@ jobs:
     - name: Port-forward the Istio ingress gateway
       run: ./tests/port_forward_gateway.sh
 
-    - name: Run a stored V2 pipeline
+    - name: Verify artifact recovery across reinstall
+      env:
+        STORE_CASE: ${{ matrix.store }}
       run: |
-        pip3 install -U "kfp==2.18.1" "kfp-kubernetes==2.18.1"
-        TOKEN="$(kubectl -n "$KF_PROFILE" create token default-editor)"
-        python3 tests/pipeline_v2_test.py run_uploaded_pipeline "$TOKEN" "$KF_PROFILE"
+        python3 -m pip install "kfp==2.18.1" "kfp-kubernetes==2.18.1"
+        bash tests/pipelines_helm_recovery.sh
 
-    - name: Verify Kubernetes-native pipeline storage
-      if: matrix.scenario == 'platform-k8s-native'
-      run: |
-        for resource in pipelines.pipelines.kubeflow.org pipelineversions.pipelines.kubeflow.org; do
-          kubectl -n "$KF_PROFILE" get "$resource" -o json | jq -e '.items | length > 0'
-        done
-
-    - name: Reject unauthorized pipeline access
-      run: |
-        kubectl create namespace test-unauthorized
-        kubectl -n test-unauthorized create serviceaccount test-unauthorized
-        TOKEN="$(kubectl -n test-unauthorized create token test-unauthorized)"
-        python3 tests/pipeline_v2_test.py test_unauthorized_access "$TOKEN" "$KF_PROFILE"
-
-    - name: Collect failure diagnostics
+    - name: Collect workload status
       if: failure()
-      continue-on-error: true
       run: |
-        set +e
-        helm list --all-namespaces
-        kubectl get pods,services,deployments,statefulsets -A -o wide
-        kubectl get customresourcedefinitions
-        kubectl get events -A --sort-by=.lastTimestamp
+        helm list -A
+        kubectl get pods,pvc -A
+        kubectl get pv

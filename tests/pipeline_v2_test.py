@@ -5,6 +5,7 @@ import sys
 import time
 import tempfile
 from pathlib import Path
+from uuid import uuid4
 from kfp import dsl
 from kfp import kubernetes
 from kfp_server_api.exceptions import ApiException
@@ -24,7 +25,33 @@ def hello_world_pipeline():
     )
 
 
-def run_pipeline(token, namespace, upload=False):
+@dsl.component(base_image="python:3.11")
+def write_dataset(value: str, dataset: dsl.Output[dsl.Dataset]):
+    from pathlib import Path
+
+    Path(dataset.path).write_text(value, encoding="utf-8")
+
+
+@dsl.component(base_image="python:3.11")
+def verify_dataset(expected: str, dataset: dsl.Input[dsl.Dataset]):
+    from pathlib import Path
+
+    if Path(dataset.path).read_text(encoding="utf-8") != expected:
+        raise ValueError("The stored dataset does not match this run")
+
+
+@dsl.pipeline(name="profile-artifact-recovery")
+def artifact_recovery_pipeline(value: str):
+    writer = write_dataset(value=value)
+    reader = verify_dataset(expected=value, dataset=writer.outputs["dataset"])
+    for task in (writer, reader):
+        task.set_caching_options(False)
+        kubernetes.set_security_context(
+            task, run_as_user=1000, run_as_group=0, run_as_non_root=True
+        )
+
+
+def run_pipeline(token, namespace, upload=False, verify_artifacts=False):
     client = kfp.Client(host="http://localhost:8080/pipeline", existing_token=token)
 
     try:
@@ -52,6 +79,14 @@ def run_pipeline(token, namespace, upload=False):
                 pipeline_id=pipeline.pipeline_id,
                 version_id=version.pipeline_version_id,
             )
+        elif verify_artifacts:
+            run = client.create_run_from_pipeline_func(
+                pipeline_func=artifact_recovery_pipeline,
+                experiment_name=experiment.display_name,
+                arguments={"value": uuid4().hex},
+                namespace=namespace,
+                enable_caching=False,
+            )
         else:
             run = client.create_run_from_pipeline_func(
                 pipeline_func=hello_world_pipeline,
@@ -62,6 +97,13 @@ def run_pipeline(token, namespace, upload=False):
             )
 
         run_id = run.run_id
+        if verify_artifacts:
+            print(f"Artifact probe run ID: {run_id}", flush=True)
+            finished = client.wait_for_run_completion(run_id=run_id, timeout=600)
+            print(f"Artifact probe final state: {finished.state}", flush=True)
+            if finished.state != "SUCCEEDED":
+                sys.exit(1)
+            return
 
         for _ in range(30):
             status = client.get_run(run_id=run_id).state
@@ -113,6 +155,8 @@ if __name__ == "__main__":
         run_pipeline(token, namespace)
     elif action == "run_uploaded_pipeline":
         run_pipeline(token, namespace, upload=True)
+    elif action == "verify_profile_artifacts":
+        run_pipeline(token, namespace, verify_artifacts=True)
     elif action == "test_unauthorized_access":
         test_unauthorized_access(token, namespace)
     else:
